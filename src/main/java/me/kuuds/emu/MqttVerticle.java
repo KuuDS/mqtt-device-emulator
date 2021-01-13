@@ -15,8 +15,6 @@ import io.vertx.mqtt.messages.MqttConnAckMessage;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static me.kuuds.emu.MqttManagerVerticle.EVENT_ADDRESS_REDEPLOY;
-
 public class MqttVerticle extends AbstractVerticle {
 
     private final Logger log = LoggerFactory.getLogger(this.getClass());
@@ -31,9 +29,11 @@ public class MqttVerticle extends AbstractVerticle {
     private final MeterRegistry registry;
     private final MqttClientConfiguration configuration;
     private MqttClient client;
+    private final String id;
 
     public MqttVerticle(MqttClientConfiguration configuration) {
         this.configuration = configuration;
+        this.id = configuration.getUsername();
         registry = BackendRegistries.getDefaultNow();
         registry.gauge("mqtt.client.online", onlineCounter);
     }
@@ -45,53 +45,53 @@ public class MqttVerticle extends AbstractVerticle {
 
     @Override
     public void start(Promise<Void> startPromise) throws Exception {
-        Future.<MqttClient>future(promise -> {
-            initClient(0, promise);
-        }).onSuccess(client -> startPromise.complete())
-                .onFailure(e -> {
-                    redeploy();
-                    startPromise.fail(e);
-                });
+        initClient();
+        Future.<Void>future(promise -> doConnect(0, promise))
+        .onSuccess(v -> {
+            doPublish();
+            startPromise.complete();
+        }).onFailure(startPromise::fail);
     }
 
-    private void redeploy() {
-        vertx.eventBus().publish(EVENT_ADDRESS_REDEPLOY, configuration);
-    }
 
-    private void initClient(int retry, Promise<MqttClient> initPromise) {
-        log.info("[MQTT|{}] mqtt client try to connect. {}", configuration);
-        if (retry >= MAX_RETRY_TIMES) {
-            initPromise.fail("[MQTT|" + clientId() + "] fail to connect over" + MAX_RETRY_TIMES + "times.");
-            return;
-        }
+    private void initClient() {
         final var options = new MqttClientOptions();
         options.setUsername(configuration.getUsername());
         options.setPassword(configuration.getPassword());
-        options.setAutoKeepAlive(true);
-        options.setKeepAliveInterval(300);
-        final var port = configuration.getPort();
-        final var host = configuration.getHost();
+        options.setAutoKeepAlive(false);
+        options.setReusePort(true);
+        options.setReconnectAttempts(-1);
+        options.setReconnectInterval(5000);
+        options.setClientId(configuration.getUsername());
         client = MqttClient.create(getVertx(), options);
         client.closeHandler(_void -> doClose(client));
+    }
+
+    private void doConnect(int retry, Promise<Void> initPromise) {
+        log.info("[MQTT|{}] connect to broker. {}", configuration);
+        if (retry >= MAX_RETRY_TIMES) {
+            initPromise.fail("[MQTT|" + id + "] fail to connect over" + MAX_RETRY_TIMES + "times.");
+            return;
+        }
+        final var port = configuration.getPort();
+        final var host = configuration.getHost();
         Future.<MqttConnAckMessage>future(promise -> client.connect(port, host, promise))
                 .onSuccess(msg -> {
                     onlineCounter.incrementAndGet();
-                    doPublish(client);
-                    initPromise.complete(client);
-                }).onFailure(e -> vertx.setTimer(timeWithLinger(5000), id -> initClient(retry + 1, initPromise)));
+                    initPromise.complete();
+                }).onFailure(e -> vertx.setTimer(timeWithLinger(5000), id -> doConnect(retry + 1, initPromise)));
     }
 
     private void doClose(MqttClient client) {
-        log.warn("[MQTT|{}] client closed.", client.clientId());
+        log.warn("[MQTT|{}] connection closed.", client.clientId());
         onlineCounter.decrementAndGet();
-        Future.<Void>future(client::disconnect)
-                .onSuccess(v -> log.info("[MQTT|{}] mqtt client disconnect.", clientId()))
-                .onFailure(e -> log.error("[MQTT|{}] mqtt client disconnect failed.", clientId(), e));
+        Future.<Void>future(promise -> doConnect(0, promise));
     }
 
-    public void doPublish(MqttClient client) {
+    public void doPublish() {
         if (client == null || !client.isConnected()) {
-            return;
+            log.info("[MQTT|{}] client disconnect. skip.", id);
+            vertx.setTimer(timeWithLinger(configuration.getPublishInterval()), id -> doPublish());
         }
         final var buffer = buildPayloadBuffer();
         final var topic = buildTopic();
@@ -102,7 +102,7 @@ public class MqttVerticle extends AbstractVerticle {
                 false,
                 false,
                 promise))
-                .onSuccess(responseCode -> vertx.setTimer(timeWithLinger(2_000), id -> doPublish(client)))
+                .onSuccess(responseCode -> vertx.setTimer(timeWithLinger(configuration.getPublishInterval()), id -> doPublish()))
                 .onFailure(e -> {
                     registry.counter("mqtt.send.message.failed").increment();
                     log.error("fail to send msg.", e);
@@ -159,16 +159,13 @@ public class MqttVerticle extends AbstractVerticle {
                 client = null;
             }
             if (_client != null) {
-                _client.disconnect(ar -> log.info("[MQTT|{}] disconnect.", clientId()));
+                _client.disconnect(ar -> log.info("[MQTT|{}] disconnect.", id));
             }
         }
     }
 
-    private int timeWithLinger(int baseTime) {
+    private long timeWithLinger(long baseTime) {
         return baseTime + new Random().nextInt(LINGER + LINGER) - LINGER;
     }
 
-    private String clientId() {
-        return client.clientId();
-    }
 }

@@ -13,6 +13,7 @@ public class MqttClientConfiguration {
     String password;
     String type;
     String payload;
+    long publishInterval;
 
 
 }

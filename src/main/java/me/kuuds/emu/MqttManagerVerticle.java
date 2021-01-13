@@ -19,10 +19,6 @@ public class MqttManagerVerticle extends AbstractVerticle {
 
     @Override
     public void start(Promise<Void> startPromise) throws Exception {
-        // read config
-        vertx.eventBus().<MqttClientConfiguration>consumer(EVENT_ADDRESS_REDEPLOY, msg -> {
-            vertx.setTimer(5000L, id -> createMqttVerticle(msg.body()));
-        });
         Future.<JsonObject>future(promise -> {
             final var fileOptions = new ConfigStoreOptions()
                     .setType("file")
@@ -46,6 +42,7 @@ public class MqttManagerVerticle extends AbstractVerticle {
                 mqttConfig.setPassword(config.getValue("mqtt.password").toString());
                 mqttConfig.setType(config.getString("mqtt.type"));
                 mqttConfig.setPayload(config.getString("mqtt.payload"));
+                mqttConfig.setPublishInterval(config.getLong("mqtt.publish.interval", 2000L));
                 futureList.add(createMqttVerticle(mqttConfig));
             }
             return CompositeFuture.all(futureList);
