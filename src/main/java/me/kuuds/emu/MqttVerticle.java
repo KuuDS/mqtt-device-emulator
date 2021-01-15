@@ -13,23 +13,26 @@ import io.vertx.mqtt.MqttClientOptions;
 import io.vertx.mqtt.messages.MqttConnAckMessage;
 
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class MqttVerticle extends AbstractVerticle {
 
     private final Logger log = LoggerFactory.getLogger(this.getClass());
     private static final int MAX_RETRY_TIMES = Integer.MAX_VALUE;
-    private static final int LINGER = 10;
-    private final Object lock = new Object();
+    private static final int PING_INTERVAL_MS = 30_000;
+    private static final int RECONNECT_INTERVAL_MS = 10_000;
     private static final String TOPIC_BASIC = "v1/devices/me";
     private static final String TOPIC_FOR_STRING = TOPIC_BASIC + "/telemetry";
     private static final String TOPIC_FOR_BYTE = TOPIC_BASIC + "/raw";
     private static final AtomicInteger onlineCounter = new AtomicInteger(0);
 
+    private final AtomicBoolean closed = new AtomicBoolean(false);
     private final MeterRegistry registry;
     private final MqttClientConfiguration configuration;
     private MqttClient client;
     private final String id;
+    private final Random random = new Random(System.nanoTime());
 
     public MqttVerticle(MqttClientConfiguration configuration) {
         this.configuration = configuration;
@@ -39,21 +42,14 @@ public class MqttVerticle extends AbstractVerticle {
     }
 
     @Override
-    public void init(Vertx vertx, Context context) {
-        super.init(vertx, context);
-    }
-
-    @Override
     public void start(Promise<Void> startPromise) throws Exception {
         initClient();
-        Future.<Void>future(promise -> doConnect(0, promise))
-                .onSuccess(v -> {
-                    doPublish();
-                    doPing();
-                    startPromise.complete();
-                }).onFailure(startPromise::fail);
+        Future.<Void>future(promise -> doConnect(0, promise)).onSuccess(v -> {
+            doPublish();
+            doPing();
+            startPromise.complete();
+        }).onFailure(startPromise::fail);
     }
-
 
     private void initClient() {
         final var options = new MqttClientOptions();
@@ -65,62 +61,57 @@ public class MqttVerticle extends AbstractVerticle {
         options.setReconnectInterval(10_000);
         options.setClientId(configuration.getUsername());
         client = MqttClient.create(getVertx(), options);
-        client.closeHandler(_void -> doClose(client));
+        client.closeHandler(v -> doClose(client));
     }
 
-    private void doConnect(int retry, Promise<Void> initPromise) {
-        log.info("[MQTT|{}] connect to broker. {}", configuration);
+    private void doConnect(int retry, Promise<Void> connectPromise) {
+        log.info("[MQTT|{}] connect to broker. {}", id, configuration);
         if (retry >= MAX_RETRY_TIMES) {
-            initPromise.fail("[MQTT|" + id + "] fail to connect over" + MAX_RETRY_TIMES + "times.");
+            connectPromise.fail("[MQTT|" + id + "] fail to connect over" + MAX_RETRY_TIMES + "times.");
             return;
         }
         final var port = configuration.getPort();
         final var host = configuration.getHost();
-        Future.<MqttConnAckMessage>future(promise -> client.connect(port, host, promise))
-                .onSuccess(msg -> {
-                    log.info("MQTT|{}] connection succeed", id);
-                    onlineCounter.incrementAndGet();
-                    initPromise.complete();
-                }).onFailure(e -> {
-                    log.error("MQTT|{}] connect failed.", id, e);
-                    vertx.setTimer(timeWithLinger(5000), id -> doConnect(retry + 1, initPromise));
+        Future.<MqttConnAckMessage>future(promise -> client.connect(port, host, promise)).onSuccess(msg -> {
+            log.info("MQTT|{}] connection succeed", id);
+            onlineCounter.incrementAndGet();
+            connectPromise.complete();
+        }).onFailure(e -> {
+            log.error("MQTT|{}] connect failed.", id, e);
+            vertx.setTimer(RECONNECT_INTERVAL_MS, tid -> doConnect(retry + 1, connectPromise));
         });
     }
 
     private void doClose(MqttClient client) {
         log.warn("[MQTT|{}] connection closed.", client.clientId());
         onlineCounter.decrementAndGet();
-        vertx.setTimer(10_000, tid -> Future.<Void>future(promise -> doConnect(0, promise)));
+        vertx.setTimer(RECONNECT_INTERVAL_MS,
+                tid -> Future.<Void>future(promise -> doConnect(0, promise)).onFailure(e -> vertx.close()));
     }
 
     private void doPing() {
         if (client != null && client.isConnected()) {
             client.ping();
         }
-        vertx.setTimer(timeWithLinger(30_000), id -> doPing());
+        vertx.setTimer(PING_INTERVAL_MS, tid -> doPing());
     }
 
     private void doPublish() {
         if (client == null || !client.isConnected()) {
             log.info("[MQTT|{}] client disconnect. skip.", id);
-            vertx.setTimer(timeWithLinger(configuration.getPublishInterval()), id -> doPublish());
+            vertx.setTimer(configuration.getPublishInterval(), tid -> doPublish());
             return;
         }
         final var buffer = buildPayloadBuffer();
         final var topic = buildTopic();
         registry.counter("mqtt.send.message.total").increment();
-        Future.<Integer>future(promise -> client.publish(topic,
-                buffer,
-                MqttQoS.AT_MOST_ONCE,
-                false,
-                false,
-                promise))
+        Future.<Integer>future(promise -> client.publish(topic, buffer, MqttQoS.AT_MOST_ONCE, false, false, promise))
                 .onComplete(ar -> {
                     if (ar.failed()) {
                         registry.counter("mqtt.send.message.failed").increment();
                         log.error("MQTT|{}] fail to send msg.", id, ar.cause());
                     }
-                    vertx.setTimer(timeWithLinger(configuration.getPublishInterval()), id -> doPublish());
+                    vertx.setTimer(configuration.getPublishInterval(), tid -> doPublish());
                 });
     }
 
@@ -142,7 +133,7 @@ public class MqttVerticle extends AbstractVerticle {
         if (type.startsWith("json") && type.endsWith("string")) {
             b = Buffer.buffer(payload);
         } else if (type.startsWith("json") && type.endsWith("json")) {
-            b = new JsonObject().put(payload, new Random().nextDouble() + new Random().nextInt(10)).toBuffer();
+            b = new JsonObject().put(payload, random.nextDouble() + random.nextInt(10)).toBuffer();
         } else if ("byte".equals(type)) {
             b = fromHexStringToBuffer(payload);
         } else {
@@ -167,20 +158,11 @@ public class MqttVerticle extends AbstractVerticle {
 
     @Override
     public void stop() throws Exception {
-        if (client != null) {
-            MqttClient _client;
-            synchronized (lock) {
-                _client = client;
-                client = null;
+        if (closed.compareAndSet(false, true) && client != null) {
+            if (client.isConnected()) {
+                client.disconnect(ar -> log.info("[MQTT|{}] disconnect.", id));
             }
-            if (_client != null) {
-                _client.disconnect(ar -> log.info("[MQTT|{}] disconnect.", id));
-            }
+            client = null;
         }
     }
-
-    private long timeWithLinger(long baseTime) {
-        return baseTime + new Random().nextInt(LINGER + LINGER) - LINGER;
-    }
-
 }

@@ -16,17 +16,14 @@ public class MqttManagerVerticle extends AbstractVerticle {
     @Override
     public void start(Promise<Void> startPromise) throws Exception {
         Future.<JsonObject>future(promise -> {
-            final var fileOptions = new ConfigStoreOptions()
-                    .setType("file")
-                    .setFormat("properties")
-                    .setOptional(true)
+            final var fileOptions = new ConfigStoreOptions().setType("file").setFormat("properties").setOptional(true)
                     .setConfig(new JsonObject().put("path", "config.properties"));
-            final var retrieverOptions = new ConfigRetrieverOptions()
-                    .addStore(fileOptions);
+            final var retrieverOptions = new ConfigRetrieverOptions().addStore(fileOptions);
             final var retriever = ConfigRetriever.create(vertx, retrieverOptions);
             retriever.getConfig(promise);
         }).compose(config -> {
-            @SuppressWarnings("rawtypes") final var futureList = new LinkedList<Future>();
+            @SuppressWarnings("rawtypes")
+            final var futureList = new LinkedList<Future>();
             final var clientSize = config.getInteger("dev.size");
             for (int i = 0; i < clientSize; ++i) {
                 final var username = String.format("%s%04x", config.getString("dev.prefix"), i);
@@ -42,7 +39,7 @@ public class MqttManagerVerticle extends AbstractVerticle {
                 futureList.add(createMqttVerticle(mqttConfig));
             }
             return CompositeFuture.all(futureList);
-        }).onSuccess(void0 -> {
+        }).onSuccess(v -> {
             log.info("application has started.");
             startPromise.complete();
         }).onFailure(cause -> {
@@ -55,6 +52,7 @@ public class MqttManagerVerticle extends AbstractVerticle {
         final var deployOptions = new DeploymentOptions();
         deployOptions.setWorker(true);
         deployOptions.setWorkerPoolName("mqtt-client");
+        deployOptions.setWorkerPoolSize(5);
         final var verticle = new MqttVerticle(mqttConfig);
         return Future.future(promise -> vertx.deployVerticle(verticle, deployOptions, promise));
     }
