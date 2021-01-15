@@ -3,10 +3,7 @@ package me.kuuds.emu;
 import io.vertx.config.ConfigRetriever;
 import io.vertx.config.ConfigRetrieverOptions;
 import io.vertx.config.ConfigStoreOptions;
-import io.vertx.core.AbstractVerticle;
-import io.vertx.core.CompositeFuture;
-import io.vertx.core.Future;
-import io.vertx.core.Promise;
+import io.vertx.core.*;
 import io.vertx.core.json.JsonObject;
 import io.vertx.core.logging.Logger;
 import io.vertx.core.logging.LoggerFactory;
@@ -15,7 +12,6 @@ import java.util.LinkedList;
 
 public class MqttManagerVerticle extends AbstractVerticle {
     final Logger log = LoggerFactory.getLogger(MqttManagerVerticle.class);
-    public static final String EVENT_ADDRESS_REDEPLOY = "redeploy";
 
     @Override
     public void start(Promise<Void> startPromise) throws Exception {
@@ -56,11 +52,11 @@ public class MqttManagerVerticle extends AbstractVerticle {
     }
 
     public Future<String> createMqttVerticle(MqttClientConfiguration mqttConfig) {
+        final var deployOptions = new DeploymentOptions();
+        deployOptions.setWorker(true);
+        deployOptions.setWorkerPoolName("mqtt-client");
         final var verticle = new MqttVerticle(mqttConfig);
-        return Future.future(promise -> vertx.deployVerticle(verticle, promise));
+        return Future.future(promise -> vertx.deployVerticle(verticle, deployOptions, promise));
     }
 
-    @Override
-    public void stop() throws Exception {
-    }
 }

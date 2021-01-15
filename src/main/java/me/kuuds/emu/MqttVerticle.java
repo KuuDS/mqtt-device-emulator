@@ -47,10 +47,11 @@ public class MqttVerticle extends AbstractVerticle {
     public void start(Promise<Void> startPromise) throws Exception {
         initClient();
         Future.<Void>future(promise -> doConnect(0, promise))
-        .onSuccess(v -> {
-            doPublish();
-            startPromise.complete();
-        }).onFailure(startPromise::fail);
+                .onSuccess(v -> {
+                    doPublish();
+                    doPing();
+                    startPromise.complete();
+                }).onFailure(startPromise::fail);
     }
 
 
@@ -60,8 +61,8 @@ public class MqttVerticle extends AbstractVerticle {
         options.setPassword(configuration.getPassword());
         options.setAutoKeepAlive(false);
         options.setReusePort(true);
-        options.setReconnectAttempts(-1);
-        options.setReconnectInterval(5000);
+        options.setReconnectAttempts(5);
+        options.setReconnectInterval(10_000);
         options.setClientId(configuration.getUsername());
         client = MqttClient.create(getVertx(), options);
         client.closeHandler(_void -> doClose(client));
@@ -77,21 +78,33 @@ public class MqttVerticle extends AbstractVerticle {
         final var host = configuration.getHost();
         Future.<MqttConnAckMessage>future(promise -> client.connect(port, host, promise))
                 .onSuccess(msg -> {
+                    log.info("MQTT|{}] connection succeed", id);
                     onlineCounter.incrementAndGet();
                     initPromise.complete();
-                }).onFailure(e -> vertx.setTimer(timeWithLinger(5000), id -> doConnect(retry + 1, initPromise)));
+                }).onFailure(e -> {
+                    log.error("MQTT|{}] connect failed.", id, e);
+                    vertx.setTimer(timeWithLinger(5000), id -> doConnect(retry + 1, initPromise));
+        });
     }
 
     private void doClose(MqttClient client) {
         log.warn("[MQTT|{}] connection closed.", client.clientId());
         onlineCounter.decrementAndGet();
-        Future.<Void>future(promise -> doConnect(0, promise));
+        vertx.setTimer(10_000, tid -> Future.<Void>future(promise -> doConnect(0, promise)));
     }
 
-    public void doPublish() {
+    private void doPing() {
+        if (client != null && client.isConnected()) {
+            client.ping();
+        }
+        vertx.setTimer(timeWithLinger(30_000), id -> doPing());
+    }
+
+    private void doPublish() {
         if (client == null || !client.isConnected()) {
             log.info("[MQTT|{}] client disconnect. skip.", id);
             vertx.setTimer(timeWithLinger(configuration.getPublishInterval()), id -> doPublish());
+            return;
         }
         final var buffer = buildPayloadBuffer();
         final var topic = buildTopic();
@@ -102,10 +115,12 @@ public class MqttVerticle extends AbstractVerticle {
                 false,
                 false,
                 promise))
-                .onSuccess(responseCode -> vertx.setTimer(timeWithLinger(configuration.getPublishInterval()), id -> doPublish()))
-                .onFailure(e -> {
-                    registry.counter("mqtt.send.message.failed").increment();
-                    log.error("fail to send msg.", e);
+                .onComplete(ar -> {
+                    if (ar.failed()) {
+                        registry.counter("mqtt.send.message.failed").increment();
+                        log.error("MQTT|{}] fail to send msg.", id, ar.cause());
+                    }
+                    vertx.setTimer(timeWithLinger(configuration.getPublishInterval()), id -> doPublish());
                 });
     }
 
